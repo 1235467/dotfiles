@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+'Enable 3-finger-drag on the specified touchpad.'
+import asyncio
+import argparse
+from random import randint
+from threading import Thread, Event
+import time
+try:
+    from evdev import ecodes, InputDevice, UInput, categorize, uinput
+except ImportError:
+    print('Error accessing evdev. Try installing the python3-evdev package.')
+    exit(1)
+from get_gesture_devices import get_gesture_devices
+
+
+# command line arguments
+opt = argparse.ArgumentParser(description=__doc__)
+opt.add_argument('-d', '--device_path', default=None,
+                 help='Path of device to read from, eg, /dev/input/event14')
+opt.add_argument('-c', '--count', default=3,
+                 help='The number of fingers to enable drag for.')
+opt.add_argument('-g', '--grab', action='store_true',
+                 help='Exclusively handle input device during drag. '
+                 'Experimental. This would prevent default DE handling of '
+                 '3-finger gestures, which is useful in cases where they '
+                 ' can\'t be configured, but this feature is still buggy: '
+                 'sometimes the drag gets stuck.')
+opt.add_argument('-l', '--lock', action='store_true', help='"Locked Drag". Enables '
+                 'a longer (500ms) timeout at the end of a drag for the purposes '
+                 'of chaining drags together.')
+args = opt.parse_args()
+
+# constants
+GRAB = args.grab
+INPUT_DEVICE_PATH = args.device_path
+TRACKING_ID_MIN = 1989
+TRACKING_ID_MAX = TRACKING_ID_MIN + 1000
+NUM_FINGERS = int(args.count)
+
+# If draggy inexplicably doesn't work for your device, try adjusting this value.
+# Unfortunately I can't infer it from the device capabilities.
+CLICK_PRESSURE = 70
+
+# duration between finger touch and drag start.
+# if NUM_FINGERS are still down at the end of this duration,
+# then the drag is allowed to start. Prevents starting drags
+# when intended gesture uses a greater number of fingers.
+TIMEOUT_DURATION_PRE = 0.02
+TIMEOUT_DURATION_POST = 0.5 if args.lock else 0.05
+
+# vars
+drag_code = ecodes.BTN_TOOL_QUADTAP if NUM_FINGERS == 4 else ecodes.BTN_TOOL_TRIPLETAP
+prevent_start = Event()
+prevent_end = Event()
+
+
+def set_lock(in_dev, lock):
+    '''Grab or ungrab the input device for exclusive handling.
+
+    Useful to prevent triggering DE defined gestures. Still buggy.
+
+    :param in_dev: The source trackpad InputDevice
+    :param lock: Boolean, whether to set or release lock
+    '''
+    if lock:
+        try:
+            in_dev.grab()
+        except IOError:
+            print('cannot grab device; may already be grabbed')
+    else:
+        try:
+            in_dev.ungrab()
+        except IOError:
+            print('cannot ungrab device; may already be ungrabbed')
+
+
+def send_3fd_frame(in_dev, sur_dev, start=False):
+    '''Send an entire event frame representing the start / stop of 3fd.
+
+    :param in_dev: The source trackpad InputDevice
+    :param sur_dev: The surrogate UInput device
+    :param start: Boolean, whether to start or stop 3fd
+    '''
+    tracking_id = -1
+    click_val = 0
+    if start:
+        tracking_id = randint(TRACKING_ID_MIN, TRACKING_ID_MAX)
+        click_val = 1
+
+    if GRAB:
+        set_lock(in_dev, start)
+
+    # to fake multitouch events, even if it's just one touch,
+    # we need to fake these events as well.
+    sur_dev.write(ecodes.EV_ABS, ecodes.ABS_MT_TRACKING_ID, tracking_id)
+    sur_dev.write(ecodes.EV_KEY, ecodes.BTN_TOUCH, click_val)
+    sur_dev.write(ecodes.EV_KEY, ecodes.BTN_TOOL_FINGER, click_val)
+    sur_dev.write(ecodes.EV_ABS, ecodes.ABS_PRESSURE, CLICK_PRESSURE * click_val)
+    sur_dev.write(ecodes.EV_ABS, ecodes.ABS_MT_PRESSURE, CLICK_PRESSURE * click_val)
+
+    # this is the actual click event
+    sur_dev.write(ecodes.EV_KEY, ecodes.BTN_LEFT, click_val)
+    sur_dev.syn()
+
+
+async def handler(in_dev, sur_dev):
+    '''The asyncio handler.'''
+    is_drag_start_frame = False
+    is_drag_end_frame = False
+    is_dragging = False
+
+
+    def maybe_send_start():
+        prevent_start.clear()
+        time.sleep(TIMEOUT_DURATION_PRE)
+        if not prevent_start.is_set():
+            send_3fd_frame(in_dev, sur_dev, start=True)
+
+
+    def maybe_send_end():
+        prevent_end.clear()
+        time.sleep(TIMEOUT_DURATION_POST)
+        if not prevent_end.is_set():
+            send_3fd_frame(in_dev, sur_dev, start=False)
+
+
+    async for event in in_dev.async_read_loop():
+        if event.type == ecodes.EV_SYN:
+            if is_drag_start_frame:
+                pre_thread = Thread(target=maybe_send_start)
+                pre_thread.start()
+                prevent_end.set()
+                is_drag_start_frame = False
+            elif is_drag_end_frame:
+                post_thread = Thread(target=maybe_send_end)
+                post_thread.start()
+                is_drag_end_frame = False
+            elif is_dragging:
+                sur_dev.syn()
+
+        elif event.type == ecodes.EV_KEY:
+            if event.code == drag_code:
+                event = categorize(event)
+                is_drag_start_frame = not is_dragging and event.keystate == 1
+                is_drag_end_frame = is_dragging and event.keystate == 0
+                is_dragging = event.keystate == 1
+            elif event.value == 1:
+                prevent_start.set()
+
+        elif is_dragging and event.type == ecodes.EV_ABS:
+            if event.code == ecodes.ABS_X:
+                sur_dev.write(ecodes.EV_ABS, ecodes.ABS_MT_POSITION_X,
+                              event.value)
+                sur_dev.write(ecodes.EV_ABS, ecodes.ABS_X, event.value)
+            elif event.code == ecodes.ABS_Y:
+                sur_dev.write(ecodes.EV_ABS, ecodes.ABS_MT_POSITION_Y,
+                              event.value)
+                sur_dev.write(ecodes.EV_ABS, ecodes.ABS_Y, event.value)
+            elif event.code == ecodes.ABS_MT_SLOT and event.value == 0:
+                sur_dev.write(ecodes.EV_ABS, ecodes.ABS_MT_SLOT, 0)
+
+        # else:
+        #     print(categorize(event), event.value)
+
+    sur_dev.close()
+
+
+async def activate_draggy_device(input_device):
+  '''Per-device coroutine'''
+
+  # get input device and create surrogate uinput device
+  try:
+      surrogate_name = input_device.name + '-draggy'
+      surrogate_caps = input_device.capabilities()
+      surrogate_device = UInput.from_device(input_device, name=surrogate_name,
+                                            version=3)
+      # this condition just creates a clone of the device with a new name,
+      # but also makes sure that it has the BTN_LEFT capability
+      if ecodes.BTN_LEFT not in surrogate_caps[ecodes.EV_KEY]:
+          del surrogate_caps[0] # https://github.com/gvalkov/python-evdev/issues/60#issuecomment-238791290
+          surrogate_caps[ecodes.EV_KEY].append(ecodes.BTN_LEFT)
+          dinfo = input_device.info
+          surrogate_device = UInput(events=surrogate_caps, name=surrogate_name,
+                                    version=dinfo.version,
+                                    vendor=dinfo.vendor,
+                                    product=dinfo.product,
+                                    bustype=dinfo.bustype,
+                                    input_props=input_device.input_props())
+  except uinput.UInputError as e:
+      print(e)
+      print('/dev/uinput might not be available, try the following:')
+      print('sudo chmod 666 /dev/uinput')
+      print('sudo modprobe uinput')
+      exit(1)
+  except FileNotFoundError:
+      print('Input device incorrect or not available. Confirm path with `libinput list-devices`.')
+      exit(1)
+
+  # start handling async events
+  print('activating draggy surrogate device for %s at %s' % (input_device.name,
+                                                             input_device.path))
+
+  return await handler(input_device, surrogate_device)
+
+
+async def main():
+  '''Main routine'''
+
+  # input check
+  if not (NUM_FINGERS == 3 or NUM_FINGERS == 4):
+      print('Draggy only works for 3 or 4 finger drag -- sorry!')
+      exit(1)
+
+  # use specified device or all available devices
+  if INPUT_DEVICE_PATH != None:
+    devices = [InputDevice(INPUT_DEVICE_PATH)]
+  else:
+    devices = get_gesture_devices(NUM_FINGERS)
+
+  # start async tasks
+  try:
+    tasks = [asyncio.create_task(activate_draggy_device(dev)) for dev in devices]
+    # await tasks
+    for task in tasks:
+        await task
+  except KeyboardInterrupt:
+    for task in tasks:
+        if not task.cancelled():
+            task.cancel()
+
+
+try:
+    asyncio.run(main())
+except KeyboardInterrupt:
+    exit(0)
